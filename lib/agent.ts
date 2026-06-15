@@ -1,32 +1,74 @@
 import path from "node:path";
-import { stat } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { z } from "zod";
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
 import {
   addTextOverlays,
+  applyEffect,
   concat,
   detectScenes,
+  insertBroll,
+  overlayGraphic,
   probe,
   trim,
   type ProbeResult,
+  type SpanEffect,
   type Transition,
 } from "./ffmpeg";
-import { renderTitleCard } from "./remotion";
+import { renderGraphicOverlay, renderTitleCard } from "./remotion";
 import {
   emit,
+  getJob,
+  getProvenance,
   getReference,
+  getSessionId,
+  listBroll,
   listFootage,
   log,
   outputPath,
+  recordClipSource,
   referenceUrlFile,
+  resolveClipSource,
   setJobMeta,
+  setSessionId,
   setStatus,
+  setTimeline,
+  stemOf,
   workspaceDirs,
 } from "./jobs";
 import { downloadYouTubeVideo } from "./youtube";
 import { readFile } from "node:fs/promises";
+import type { VideoRange, VideoTimeline } from "./types";
 
 const SERVER_NAME = "editor";
+
+/** Probe each ordered clip, resolve its origin, and build the timeline model. */
+async function buildTimeline(
+  jobId: string,
+  clipPaths: string[],
+  width: number,
+  height: number,
+  transition: VideoTimeline["transition"],
+): Promise<VideoTimeline> {
+  const durations = await Promise.all(
+    clipPaths.map((c) => probe(c).then((p) => p.duration).catch(() => 0)),
+  );
+  const prov = getProvenance(jobId);
+  let acc = 0;
+  const clips = clipPaths.map((c, i) => {
+    const stem = stemOf(c);
+    const item = {
+      name: stem,
+      startS: acc,
+      durationS: durations[i],
+      source: resolveClipSource(stem, prov),
+    };
+    acc += durations[i];
+    return item;
+  });
+  return { clips, totalS: acc, width, height, transition };
+}
 
 function withinWorkspace(jobId: string, p: string): string {
   const dirs = workspaceDirs(jobId);
@@ -100,6 +142,27 @@ function buildEditorServer(jobId: string) {
         at: Date.now(),
       });
       return ok({ reference: ref });
+    },
+  );
+
+  const list_broll = tool(
+    "list_broll",
+    "List the b-roll clips uploaded for this job — supplementary cutaway footage to overlay on top of the main (A-roll) clips. Returns absolute file paths; empty if none were uploaded.",
+    {},
+    async () => {
+      try {
+        const items = await listBroll(jobId);
+        emit(jobId, {
+          type: "tool_result",
+          tool: "list_broll",
+          ok: true,
+          summary: items.length ? `${items.length} b-roll clips` : "no b-roll",
+          at: Date.now(),
+        });
+        return ok({ broll: items });
+      } catch (e) {
+        return err(String(e));
+      }
     },
   );
 
@@ -187,6 +250,12 @@ function buildEditorServer(jobId: string) {
         });
         await trim(abs, out, start_s, duration_s);
         await stat(out);
+        recordClipSource(jobId, name, {
+          kind: "trim",
+          source: abs,
+          startS: start_s,
+          durationS: duration_s,
+        });
         emit(jobId, {
           type: "tool_result",
           tool: "trim_clip",
@@ -263,6 +332,7 @@ function buildEditorServer(jobId: string) {
         });
         await addTextOverlays(abs, out, overlays);
         await stat(out);
+        recordClipSource(jobId, name, { kind: "derive", from: stemOf(source), op: "caption" });
         emit(jobId, {
           type: "tool_result",
           tool: "add_text_overlay",
@@ -317,6 +387,7 @@ function buildEditorServer(jobId: string) {
           (msg) => log(jobId, "info", msg),
         );
         await stat(out);
+        recordClipSource(jobId, name, { kind: "title" });
         emit(jobId, {
           type: "tool_result",
           tool: "render_title_card",
@@ -380,6 +451,19 @@ function buildEditorServer(jobId: string) {
         );
         await stat(out);
         setJobMeta(jobId, { outputAvailable: true });
+
+        // Capture a structured timeline so the UI can render real clip cards.
+        setTimeline(
+          jobId,
+          await buildTimeline(
+            jobId,
+            clips,
+            target_width,
+            target_height,
+            transition ? { type: transition.type, durationS: transition.duration_s } : null,
+          ),
+        );
+
         const transitionSuffix = transition
           ? ` with ${transition.type} ${transition.duration_s}s transitions`
           : " (hard cuts)";
@@ -391,6 +475,212 @@ function buildEditorServer(jobId: string) {
           at: Date.now(),
         });
         return ok({ output: out });
+      } catch (e) {
+        return err(String(e));
+      }
+    },
+  );
+
+  const add_graphic = tool(
+    "add_graphic",
+    "Overlay an ANIMATED motion-graphic on a clip with transparency. kind 'lower_third' = a name/label bar that slides in from the left (title + optional subtitle; great for introducing a person or place). kind 'callout' = a pill badge that pops in, centered (short highlight/label). Unlike add_text_overlay (static burned text), this is animated. position sets vertical placement; theme matches mood. Returns a new clip path; use it IN PLACE OF the source in assemble_edit. at_s/duration_s are relative to the clip's own timeline.",
+    {
+      source: z.string().describe("Absolute path to a clip in this job's workspace"),
+      name: z
+        .string()
+        .regex(/^[a-zA-Z0-9_-]+$/)
+        .describe("Output filename stem, e.g. 'clip_02_l3'"),
+      kind: z.enum(["lower_third", "callout"]),
+      title: z.string().min(1).max(80),
+      subtitle: z
+        .string()
+        .max(80)
+        .optional()
+        .describe("Lower-third only; small line under the title"),
+      theme: z.enum(["minimal", "bold", "cinematic"]),
+      position: z.enum(["top", "center", "bottom"]).default("bottom"),
+      at_s: z.number().min(0).default(0),
+      duration_s: z.number().min(0.5).max(20).default(3),
+    },
+    async ({ source, name, kind, title, subtitle, theme, position, at_s, duration_s }) => {
+      try {
+        const baseAbs = withinWorkspace(jobId, source);
+        const meta = await probe(baseAbs);
+        const out = path.join(dirs.clips, `${name}.mp4`);
+        emit(jobId, {
+          type: "tool",
+          tool: "add_graphic",
+          input: { source, name, kind, title, position, at_s, duration_s },
+          at: Date.now(),
+        });
+        const work = await mkdtemp(path.join(tmpdir(), "ve-gfx-"));
+        try {
+          const mov = path.join(work, "overlay.mov");
+          await renderGraphicOverlay(
+            mov,
+            {
+              kind,
+              title,
+              subtitle,
+              theme,
+              position,
+              width: meta.width,
+              height: meta.height,
+              duration_s,
+              fps: meta.fps && meta.fps > 0 ? Math.round(meta.fps) : 30,
+            },
+            (m) => log(jobId, "info", m),
+          );
+          await overlayGraphic(baseAbs, mov, out, at_s, duration_s);
+        } finally {
+          await rm(work, { recursive: true, force: true });
+        }
+        await stat(out);
+        recordClipSource(jobId, name, { kind: "derive", from: stemOf(source), op: kind });
+        emit(jobId, {
+          type: "tool_result",
+          tool: "add_graphic",
+          ok: true,
+          summary: `${name}.mp4 (${kind} "${title}", ${duration_s}s @ ${at_s}s)`,
+          at: Date.now(),
+        });
+        return ok({ path: out });
+      } catch (e) {
+        return err(String(e));
+      }
+    },
+  );
+
+  const insert_broll = tool(
+    "insert_broll",
+    "Overlay a b-roll clip onto a base (A-roll) clip as a cutaway. The base clip's AUDIO keeps playing underneath the whole time — only the picture changes during the window. mode 'replace' shows the b-roll full-frame from at_s for duration_s (classic b-roll); mode 'pip' shows it small in the top-right corner. Returns a new clip path; use it in assemble_edit IN PLACE OF the base clip. at_s/duration_s are relative to the base clip's own timeline.",
+    {
+      base: z.string().describe("Absolute path to the A-roll clip to cut away from"),
+      broll: z.string().describe("Absolute path to a b-roll clip (from list_broll)"),
+      name: z
+        .string()
+        .regex(/^[a-zA-Z0-9_-]+$/)
+        .describe("Output filename stem, e.g. 'clip_03_broll'"),
+      at_s: z.number().min(0).describe("When the cutaway starts within the base clip"),
+      duration_s: z.number().min(0.3).max(30),
+      mode: z.enum(["replace", "pip"]).default("replace"),
+    },
+    async ({ base, broll, name, at_s, duration_s, mode }) => {
+      try {
+        const baseAbs = withinWorkspace(jobId, base);
+        const brollAbs = withinWorkspace(jobId, broll);
+        const out = path.join(dirs.clips, `${name}.mp4`);
+        emit(jobId, {
+          type: "tool",
+          tool: "insert_broll",
+          input: { base, broll, name, at_s, duration_s, mode },
+          at: Date.now(),
+        });
+        await insertBroll(baseAbs, brollAbs, out, at_s, duration_s, mode);
+        await stat(out);
+        recordClipSource(jobId, name, { kind: "derive", from: stemOf(base), op: "b-roll" });
+        emit(jobId, {
+          type: "tool_result",
+          tool: "insert_broll",
+          ok: true,
+          summary: `${name}.mp4 (${mode} b-roll ${duration_s.toFixed(1)}s @ ${at_s.toFixed(1)}s)`,
+          at: Date.now(),
+        });
+        return ok({ path: out });
+      } catch (e) {
+        return err(String(e));
+      }
+    },
+  );
+
+  const split_output_span = tool(
+    "split_output_span",
+    "Split the current edited video (output/final.mp4) at a time span into up to three clips: the part BEFORE the span, the span ITSELF, and the part AFTER. Use this to edit just a portion the user selected on the player. Then: process the returned `span` clip (apply_effect, add_text_overlay, trim, or drop it entirely to delete that section), and finally call assemble_edit with [before, <your edited span>, after] (skip any that are null) to rebuild the video. Times are seconds within the current edit.",
+    {
+      start_s: z.number().min(0),
+      end_s: z.number().min(0.1),
+      prefix: z
+        .string()
+        .regex(/^[a-zA-Z0-9_-]+$/)
+        .default("span")
+        .describe("Filename stem for the produced clips"),
+    },
+    async ({ start_s, end_s, prefix }) => {
+      try {
+        const out = outputPath(jobId);
+        emit(jobId, {
+          type: "tool",
+          tool: "split_output_span",
+          input: { start_s, end_s, prefix },
+          at: Date.now(),
+        });
+        const meta = await probe(out);
+        const dur = meta.duration;
+        const start = Math.max(0, Math.min(start_s, dur));
+        const end = Math.max(start + 0.1, Math.min(end_s, dur));
+        const before = start > 0.05 ? path.join(dirs.clips, `${prefix}_before.mp4`) : null;
+        const span = path.join(dirs.clips, `${prefix}_mid.mp4`);
+        const after = end < dur - 0.05 ? path.join(dirs.clips, `${prefix}_after.mp4`) : null;
+        if (before) await trim(out, before, 0, start);
+        await trim(out, span, start, end - start);
+        if (after) await trim(out, after, end, dur - end);
+        if (before) recordClipSource(jobId, `${prefix}_before`, { kind: "span" });
+        recordClipSource(jobId, `${prefix}_mid`, { kind: "span" });
+        if (after) recordClipSource(jobId, `${prefix}_after`, { kind: "span" });
+        emit(jobId, {
+          type: "tool_result",
+          tool: "split_output_span",
+          ok: true,
+          summary: `span ${start.toFixed(1)}-${end.toFixed(1)}s of ${dur.toFixed(1)}s edit → ${[before && "before", "span", after && "after"].filter(Boolean).join(", ")}`,
+          at: Date.now(),
+        });
+        return ok({ before, span, after, duration_s: dur });
+      } catch (e) {
+        return err(String(e));
+      }
+    },
+  );
+
+  const apply_effect = tool(
+    "apply_effect",
+    "Apply a visual/temporal effect to a clip and write a new clip. Effects: speed (factor 0.25-4; <1 slow-motion, >1 faster — audio is retimed to match), grayscale (black & white), blur (strength 1-50), brightness (-1 darker … +1 brighter). Returns the new clip path; use it in assemble_edit in place of the source. Great for span edits: split_output_span, then apply_effect on the returned span.",
+    {
+      source: z.string().describe("Absolute path to a clip in this job's workspace"),
+      name: z
+        .string()
+        .regex(/^[a-zA-Z0-9_-]+$/)
+        .describe("Output filename stem, e.g. 'span_mid_fast'"),
+      effect: z.discriminatedUnion("name", [
+        z.object({ name: z.literal("speed"), factor: z.number().min(0.25).max(4) }),
+        z.object({ name: z.literal("grayscale") }),
+        z.object({
+          name: z.literal("blur"),
+          strength: z.number().min(1).max(50).default(10),
+        }),
+        z.object({ name: z.literal("brightness"), value: z.number().min(-1).max(1) }),
+      ]),
+    },
+    async ({ source, name, effect }) => {
+      try {
+        const abs = withinWorkspace(jobId, source);
+        const outClip = path.join(dirs.clips, `${name}.mp4`);
+        emit(jobId, {
+          type: "tool",
+          tool: "apply_effect",
+          input: { source, name, effect: effect.name },
+          at: Date.now(),
+        });
+        await applyEffect(abs, outClip, effect as SpanEffect);
+        await stat(outClip);
+        recordClipSource(jobId, name, { kind: "derive", from: stemOf(source), op: effect.name });
+        emit(jobId, {
+          type: "tool_result",
+          tool: "apply_effect",
+          ok: true,
+          summary: `${name}.mp4 (${effect.name})`,
+          at: Date.now(),
+        });
+        return ok({ path: outClip });
       } catch (e) {
         return err(String(e));
       }
@@ -415,11 +705,16 @@ function buildEditorServer(jobId: string) {
     tools: [
       list_footage,
       get_reference,
+      list_broll,
       probe_clip,
       detect_scenes_tool,
       trim_clip,
       add_text_overlay,
       render_title_card,
+      add_graphic,
+      insert_broll,
+      split_output_span,
+      apply_effect,
       assemble_edit,
       note,
     ],
@@ -444,7 +739,9 @@ Workflow you must follow:
 7. Optionally add titles. You have TWO options — pick what fits:
    a. STATIC text burned on top of a footage clip via add_text_overlay — best for lower-thirds, locations, brief labels mid-video. Returns a new clip path; use IT (not the original) in assemble_edit.
    b. ANIMATED motion-graphics title card via render_title_card — best for a polished opener or closer. This produces its own standalone clip (no footage underneath). Title text 1-5 words; pick a theme that matches the reference's mood: "minimal" for neutral/contemplative, "bold" for energetic/social-media, "cinematic" for slow/atmospheric. Duration 2-3.5s. Match width/height/fps to your target_edit. Then add the returned clip as the FIRST (intro) or LAST (outro) entry in assemble_edit's clips list.
-   - You can use both (a tasteful intro card + a mid-clip lower-third). Skip titles entirely if nothing meaningful to add.
+   c. ANIMATED overlay graphic ON TOP of a footage clip via add_graphic — a lower_third (name/label bar that slides in) or a callout (pill badge that pops in). Use this instead of (a) when you want motion: introduce a speaker/place with a lower_third, or pop a short highlight with a callout. Returns a new clip path; use IT (not the original) in assemble_edit.
+   - You can mix these (e.g. a bold intro card + an animated lower-third on the first talking clip). Skip titles entirely if nothing meaningful to add.
+7.5. B-ROLL (optional). Call list_broll. If b-roll clips exist, they are supplementary cutaway footage meant to play OVER your main clips. For a clip whose audio is worth keeping (someone talking, narration, ambient sound) but whose picture is static or dull, call insert_broll(base=<that clip>, broll=<a b-roll clip>, at_s, duration_s, mode="replace") to cut away to b-roll while the base audio continues. Use it on 1-3 clips at most — b-roll should accent, not dominate. Use the returned clip IN PLACE OF the base clip in assemble_edit. Skip entirely if there is no b-roll or nothing benefits from a cutaway.
 8. Choose an ordering that feels good (chronological per source, or grouped by visual energy; you decide). If you rendered an intro card, it goes first; outro goes last.
 9. Call assemble_edit ONCE with the ordered clip paths and target resolution. Pick a transition:
    - Energetic / many scene changes → omit transition (hard cuts) or use a short fade (0.25s).
@@ -453,7 +750,119 @@ Workflow you must follow:
    - When unsure, default to fade at 0.4s. Include a one-sentence note describing your edit decisions.
 10. After assemble_edit succeeds, reply with a single sentence summarizing the result and stop. Do not call any more tools.
 
+FOLLOW-UP REQUESTS (interactive mode):
+After the first edit is delivered, the user may keep chatting to revise it — e.g. "make the intro shorter", "add a caption at 0:12", "use a punchier transition", "swap clips 2 and 3". This conversation is resumed, so you still have all your earlier context and the trimmed clips in clips/ still exist. For each follow-up:
+ - Make the SMALLEST change that satisfies the request; don't redo the whole edit.
+ - Reuse existing clips where possible; only re-trim or re-render what must change.
+ - SPAN EDITS: when the user selected a time range of the current cut (you'll be told the start/end seconds, or they reference a timestamp), use split_output_span(start_s, end_s) to cut output/final.mp4 into before / span / after. Then transform just the span — apply_effect (speed/grayscale/blur/brightness), add_text_overlay (caption), trim it shorter, or omit it entirely to delete that section — and call assemble_edit with [before, <edited span>, after] (skip nulls) to rebuild. This guarantees you only touch the selected region.
+ - Call assemble_edit again to refresh output/final.mp4, preserving everything the user didn't ask to change.
+ - Then reply with one sentence describing what changed, and stop.
+
 Use the note tool sparingly to explain non-obvious choices. Be decisive — don't ask for clarification, and don't loop forever. If a tool errors, log it via note and try once more with adjusted inputs, then move on.`;
+
+const EDITOR_TOOLS = [
+  "list_footage",
+  "get_reference",
+  "list_broll",
+  "probe_clip",
+  "detect_scenes",
+  "trim_clip",
+  "add_text_overlay",
+  "render_title_card",
+  "add_graphic",
+  "insert_broll",
+  "split_output_span",
+  "apply_effect",
+  "assemble_edit",
+  "note",
+].map((n) => `mcp__${SERVER_NAME}__${n}`);
+
+/**
+ * Run a single agent turn against the job's workspace. Used both for the first
+ * autonomous edit and for each follow-up chat message (via `resume`). Streams
+ * assistant/tool events as they arrive and returns the session id so the next
+ * turn can resume the conversation.
+ */
+async function runAgentTurn(
+  jobId: string,
+  opts: { prompt: string; resume?: string },
+): Promise<{ sessionId: string | null; ok: boolean }> {
+  const mcp = buildEditorServer(jobId);
+  const dirs = workspaceDirs(jobId);
+  let sessionId: string | null = null;
+  let ok = false;
+
+  const q = query({
+    prompt: opts.prompt,
+    options: {
+      systemPrompt: SYSTEM_PROMPT,
+      mcpServers: { [SERVER_NAME]: mcp },
+      tools: [],
+      allowedTools: EDITOR_TOOLS,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      cwd: dirs.root,
+      ...(opts.resume ? { resume: opts.resume } : {}),
+      env: { ...process.env, CLAUDE_AGENT_SDK_CLIENT_APP: "video-editor/0.1" },
+    },
+  });
+
+  for await (const msg of q) {
+    if (msg.type === "assistant") {
+      const blocks = msg.message?.content ?? [];
+      for (const b of blocks) {
+        if (b.type === "text" && b.text.trim()) {
+          emit(jobId, { type: "assistant", text: b.text, at: Date.now() });
+        } else if (b.type === "tool_use") {
+          emit(jobId, { type: "tool", tool: b.name, input: b.input, at: Date.now() });
+        }
+      }
+      if (msg.error) {
+        log(jobId, "error", `Assistant error: ${msg.error}`);
+      }
+    } else if (msg.type === "result") {
+      sessionId = msg.session_id ?? sessionId;
+      if (msg.subtype === "success") {
+        ok = true;
+        log(
+          jobId,
+          "info",
+          `Agent finished in ${(msg.duration_ms / 1000).toFixed(1)}s (${msg.num_turns} turns, $${msg.total_cost_usd.toFixed(4)})`,
+        );
+      } else {
+        log(jobId, "error", `Agent ended with error: ${JSON.stringify(msg)}`);
+      }
+    }
+  }
+
+  return { sessionId, ok };
+}
+
+/**
+ * Reconcile job status against what's on disk after a turn ends. The first turn
+ * must produce output/final.mp4 or it failed; follow-up turns may legitimately
+ * not touch the output (e.g. answering a question), so a missing output is only
+ * fatal when `requireOutput` is set.
+ */
+async function finalizeTurn(jobId: string, requireOutput: boolean): Promise<void> {
+  const out = outputPath(jobId);
+  let outOk = false;
+  try {
+    await stat(out);
+    outOk = true;
+  } catch {
+    outOk = false;
+  }
+  setJobMeta(jobId, { outputAvailable: outOk });
+  if (!outOk && requireOutput) {
+    setJobMeta(jobId, { error: "Agent finished without producing output/final.mp4" });
+    setStatus(jobId, "failed");
+    emit(jobId, { type: "done", outputPath: null, at: Date.now() });
+    return;
+  }
+  setStatus(jobId, "completed");
+  emit(jobId, { type: "done", outputPath: outOk ? out : null, at: Date.now() });
+}
 
 export async function runEditorAgent(jobId: string): Promise<void> {
   setStatus(jobId, "running");
@@ -509,95 +918,141 @@ export async function runEditorAgent(jobId: string): Promise<void> {
     return;
   }
 
-  const mcp = buildEditorServer(jobId);
+  const broll = await listBroll(jobId);
   const dirs = workspaceDirs(jobId);
-  const allowed = [
-    "list_footage",
-    "get_reference",
-    "probe_clip",
-    "detect_scenes",
-    "trim_clip",
-    "add_text_overlay",
-    "render_title_card",
-    "assemble_edit",
-    "note",
-  ].map((n) => `mcp__${SERVER_NAME}__${n}`);
-
   const userPrompt = [
     `Job workspace: ${dirs.root}`,
     `Footage count: ${footage.length}`,
     `Reference video: ${ref ? "yes" : "no"}`,
+    `B-roll clips: ${broll.length > 0 ? `${broll.length} (consider cutaways)` : "none"}`,
     "",
     "Begin the edit now. Follow the workflow exactly.",
   ].join("\n");
 
   try {
-    const q = query({
-      prompt: userPrompt,
-      options: {
-        systemPrompt: SYSTEM_PROMPT,
-        mcpServers: { [SERVER_NAME]: mcp },
-        tools: [],
-        allowedTools: allowed,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        cwd: dirs.root,
-        env: { ...process.env, CLAUDE_AGENT_SDK_CLIENT_APP: "video-editor/0.1" },
-      },
-    });
-
-    for await (const msg of q) {
-      if (msg.type === "assistant") {
-        const blocks = msg.message?.content ?? [];
-        for (const b of blocks) {
-          if (b.type === "text" && b.text.trim()) {
-            emit(jobId, { type: "assistant", text: b.text, at: Date.now() });
-          } else if (b.type === "tool_use") {
-            emit(jobId, {
-              type: "tool",
-              tool: b.name,
-              input: b.input,
-              at: Date.now(),
-            });
-          }
-        }
-        if (msg.error) {
-          log(jobId, "error", `Assistant error: ${msg.error}`);
-        }
-      } else if (msg.type === "result") {
-        if (msg.subtype === "success") {
-          log(
-            jobId,
-            "info",
-            `Agent finished in ${(msg.duration_ms / 1000).toFixed(1)}s (${msg.num_turns} turns, $${msg.total_cost_usd.toFixed(4)})`,
-          );
-        } else {
-          log(jobId, "error", `Agent ended with error: ${JSON.stringify(msg)}`);
-        }
-      }
-    }
-
-    const out = outputPath(jobId);
-    let outOk = false;
-    try {
-      await stat(out);
-      outOk = true;
-    } catch {
-      outOk = false;
-    }
-    if (outOk) {
-      setStatus(jobId, "completed");
-      emit(jobId, { type: "done", outputPath: out, at: Date.now() });
-    } else {
-      setJobMeta(jobId, { error: "Agent finished without producing output/final.mp4" });
-      setStatus(jobId, "failed");
-      emit(jobId, { type: "done", outputPath: null, at: Date.now() });
-    }
+    const { sessionId } = await runAgentTurn(jobId, { prompt: userPrompt });
+    if (sessionId) setSessionId(jobId, sessionId);
+    await finalizeTurn(jobId, true);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     log(jobId, "error", `Agent crashed: ${msg}`);
     setJobMeta(jobId, { error: msg });
     setStatus(jobId, "failed");
     emit(jobId, { type: "done", outputPath: null, at: Date.now() });
+  }
+}
+
+function buildFollowupPrompt(text: string, range?: VideoRange): string {
+  const lines: string[] = [];
+  if (range) {
+    lines.push(
+      `The user selected the span ${range.startS.toFixed(2)}s–${range.endS.toFixed(2)}s of the current edit (output/final.mp4) and wants the change applied to that span.`,
+    );
+  }
+  lines.push(`User request: ${text}`);
+  lines.push("");
+  lines.push(
+    "Apply this to the existing edit, reusing clips where possible, then call assemble_edit to refresh output/final.mp4. Preserve everything the user didn't ask to change. Reply with one sentence describing what changed, then stop.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Continue an existing edit from a chat message. Resumes the agent's session so
+ * it keeps all prior context, applies the requested change, and refreshes the
+ * output. Streams events into the same job channel as the initial run.
+ */
+export async function sendAgentMessage(
+  jobId: string,
+  text: string,
+  range?: VideoRange,
+): Promise<void> {
+  const sessionId = getSessionId(jobId);
+  if (!sessionId) {
+    throw new Error("This job has no resumable session yet — wait for the first edit to finish.");
+  }
+
+  emit(jobId, { type: "user_message", text, range, at: Date.now() });
+  setJobMeta(jobId, { error: undefined });
+  setStatus(jobId, "running");
+
+  try {
+    const { sessionId: newId } = await runAgentTurn(jobId, {
+      prompt: buildFollowupPrompt(text, range),
+      resume: sessionId,
+    });
+    if (newId) setSessionId(jobId, newId);
+    await finalizeTurn(jobId, false);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(jobId, "error", `Agent crashed: ${msg}`);
+    setJobMeta(jobId, { error: msg });
+    setStatus(jobId, "failed");
+    emit(jobId, { type: "done", outputPath: null, at: Date.now() });
+  }
+}
+
+/**
+ * Deterministic manual re-trim of a single timeline clip (no LLM). Re-cuts the
+ * clip from its source footage with new in/out points, then re-assembles the
+ * final video using the existing clip order. Only works on plain trimmed clips;
+ * clips with effects/graphics must be adjusted via the Assistant.
+ */
+export async function manualRetrim(
+  jobId: string,
+  clipName: string,
+  inS: number,
+  outS: number,
+): Promise<void> {
+  const job = getJob(jobId);
+  if (!job?.timeline) throw new Error("No timeline to edit yet.");
+  const prov = getProvenance(jobId)[clipName];
+  if (!prov || prov.kind !== "trim") {
+    throw new Error("This clip has effects or is generated — adjust it via the Assistant.");
+  }
+
+  const timeline = job.timeline;
+  setJobMeta(jobId, { error: undefined });
+  setStatus(jobId, "running");
+  try {
+    const src = await probe(prov.source);
+    const max = src.duration;
+    const ni = Math.max(0, Math.min(inS, max - 0.2));
+    const no = Math.max(ni + 0.2, Math.min(outS, max));
+    log(
+      jobId,
+      "info",
+      `Manual trim: ${clipName} ← ${path.basename(prov.source)} [${ni.toFixed(2)}–${no.toFixed(2)}]`,
+    );
+
+    const dirs = workspaceDirs(jobId);
+    const clipPath = path.join(dirs.clips, `${clipName}.mp4`);
+    await trim(prov.source, clipPath, ni, no - ni);
+    recordClipSource(jobId, clipName, {
+      kind: "trim",
+      source: prov.source,
+      startS: ni,
+      durationS: no - ni,
+    });
+
+    const order = timeline.clips.map((c) => path.join(dirs.clips, `${c.name}.mp4`));
+    const transition = timeline.transition
+      ? { type: timeline.transition.type as Transition["type"], duration_s: timeline.transition.durationS }
+      : undefined;
+    const out = outputPath(jobId);
+    await concat(order, out, timeline.width, timeline.height, 30, transition);
+    setTimeline(
+      jobId,
+      await buildTimeline(jobId, order, timeline.width, timeline.height, timeline.transition),
+    );
+    setJobMeta(jobId, { outputAvailable: true });
+    setStatus(jobId, "completed");
+    emit(jobId, { type: "done", outputPath: out, at: Date.now() });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(jobId, "error", `Manual trim failed: ${msg}`);
+    setJobMeta(jobId, { error: msg });
+    setStatus(jobId, "completed");
+    emit(jobId, { type: "done", outputPath: outputPath(jobId), at: Date.now() });
   }
 }

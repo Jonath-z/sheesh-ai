@@ -1,12 +1,15 @@
 import type { NextRequest } from "next/server";
-import { getJob, subscribe } from "@/lib/jobs";
+import { loadJob, subscribe } from "@/lib/jobs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET(req: NextRequest, ctx: RouteContext<"/api/jobs/[id]/stream">) {
+export async function GET(
+  req: NextRequest,
+  ctx: RouteContext<"/api/jobs/[id]/stream">,
+) {
   const { id } = await ctx.params;
-  const job = getJob(id);
+  const job = await loadJob(id);
   if (!job) return new Response("Not found", { status: 404 });
 
   const encoder = new TextEncoder();
@@ -15,7 +18,9 @@ export async function GET(req: NextRequest, ctx: RouteContext<"/api/jobs/[id]/st
     start(controller) {
       const send = (data: unknown) => {
         try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(data)}\n\n`),
+          );
         } catch {
           // controller closed
         }

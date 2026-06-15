@@ -23,6 +23,9 @@ export async function POST(request: Request) {
   }
 
   const footage = form.getAll("footage").filter((v): v is File => v instanceof File);
+  const broll = form
+    .getAll("broll")
+    .filter((v): v is File => v instanceof File && v.size > 0);
   const referenceField = form.get("reference");
   const reference = referenceField instanceof File && referenceField.size > 0 ? referenceField : null;
   const referenceUrlField = form.get("reference_url");
@@ -54,6 +57,14 @@ export async function POST(request: Request) {
     const name = safeName(f.name, `footage_${String(idx).padStart(2, "0")}`);
     await writeFile(path.join(dirs.raw, `${String(idx).padStart(2, "0")}_${name}`), buf);
     idx++;
+  }
+
+  let bidx = 0;
+  for (const f of broll) {
+    const buf = Buffer.from(await f.arrayBuffer());
+    const name = safeName(f.name, `broll_${String(bidx).padStart(2, "0")}`);
+    await writeFile(path.join(dirs.broll, `${String(bidx).padStart(2, "0")}_${name}`), buf);
+    bidx++;
   }
 
   if (reference) {

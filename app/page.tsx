@@ -6,6 +6,7 @@ import { useState } from "react";
 export default function Home() {
   const router = useRouter();
   const [footage, setFootage] = useState<File[]>([]);
+  const [broll, setBroll] = useState<File[]>([]);
   const [reference, setReference] = useState<File | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -19,6 +20,7 @@ export default function Home() {
     try {
       const form = new FormData();
       for (const f of footage) form.append("footage", f);
+      for (const f of broll) form.append("broll", f);
       if (reference) {
         form.append("reference", reference);
       } else if (referenceUrl.trim()) {
@@ -68,6 +70,32 @@ export default function Home() {
             {footage.length > 0 && (
               <ul className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
                 {footage.map((f) => (
+                  <li key={f.name + f.size} className="truncate">
+                    {f.name} <span className="opacity-60">({prettySize(f.size)})</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </fieldset>
+
+          <fieldset className="flex flex-col gap-2 rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
+            <legend className="px-2 text-xs font-medium uppercase tracking-widest text-zinc-500">
+              B-roll (optional)
+            </legend>
+            <p className="text-xs text-zinc-500">
+              Cutaway footage the agent can lay over your main clips while the
+              original audio keeps playing.
+            </p>
+            <input
+              type="file"
+              accept="video/*"
+              multiple
+              onChange={(e) => setBroll(Array.from(e.target.files ?? []))}
+              className="text-sm file:mr-4 file:rounded-full file:border-0 file:bg-zinc-200 file:px-4 file:py-2 file:text-sm file:font-medium file:text-zinc-900 hover:file:bg-zinc-300 dark:file:bg-zinc-800 dark:file:text-zinc-100 dark:hover:file:bg-zinc-700"
+            />
+            {broll.length > 0 && (
+              <ul className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                {broll.map((f) => (
                   <li key={f.name + f.size} className="truncate">
                     {f.name} <span className="opacity-60">({prettySize(f.size)})</span>
                   </li>

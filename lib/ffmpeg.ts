@@ -333,3 +333,219 @@ export async function addTextOverlays(
     await rm(work, { recursive: true, force: true });
   }
 }
+
+/**
+ * A simple effect applied to a whole clip. Used for span-scoped edits like
+ * "speed this part up" or "make this section black and white".
+ */
+export type SpanEffect =
+  | { name: "speed"; factor: number }
+  | { name: "grayscale" }
+  | { name: "blur"; strength?: number }
+  | { name: "brightness"; value: number };
+
+/** Chain `atempo` filters (each limited to 0.5–2.0) to reach an arbitrary factor. */
+function atempoChain(factor: number): string {
+  let f = factor;
+  const parts: string[] = [];
+  while (f > 2.0 + 1e-9) {
+    parts.push("atempo=2.0");
+    f /= 2;
+  }
+  while (f < 0.5 - 1e-9) {
+    parts.push("atempo=0.5");
+    f *= 2;
+  }
+  parts.push(`atempo=${f.toFixed(4)}`);
+  return parts.join(",");
+}
+
+/**
+ * Apply a single effect to `input`, writing a new clip to `output`. Audio is
+ * copied through untouched except for `speed`, where it is retimed to match.
+ */
+export async function applyEffect(
+  input: string,
+  output: string,
+  effect: SpanEffect,
+): Promise<void> {
+  const meta = await probe(input);
+  const args: string[] = ["-hide_banner", "-y", "-i", input];
+  let vf = "";
+  let af: string | null = null;
+
+  switch (effect.name) {
+    case "speed": {
+      const f = Math.min(4, Math.max(0.25, effect.factor));
+      vf = `setpts=${(1 / f).toFixed(5)}*PTS`;
+      af = meta.hasAudio ? atempoChain(f) : null;
+      break;
+    }
+    case "grayscale":
+      vf = "hue=s=0";
+      break;
+    case "blur": {
+      const s = Math.min(50, Math.max(1, effect.strength ?? 10));
+      vf = `boxblur=${s}:1`;
+      break;
+    }
+    case "brightness": {
+      const v = Math.min(1, Math.max(-1, effect.value));
+      vf = `eq=brightness=${v.toFixed(3)}`;
+      break;
+    }
+  }
+  vf += ",format=yuv420p";
+
+  args.push("-vf", vf);
+  if (af) args.push("-af", af);
+  args.push(
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "20",
+    "-pix_fmt",
+    "yuv420p",
+  );
+  if (af) {
+    args.push("-c:a", "aac", "-b:a", "128k");
+  } else if (meta.hasAudio) {
+    args.push("-c:a", "copy");
+  }
+  args.push("-movflags", "+faststart", output);
+
+  await runCapture("ffmpeg", args, { timeoutMs: 10 * 60_000 });
+}
+
+export type BrollMode = "replace" | "pip";
+
+/**
+ * Overlay a b-roll clip onto a base (A-roll) clip as a cutaway. The base clip's
+ * AUDIO always plays underneath — only the picture changes during the window.
+ *   - "replace": b-roll fills the frame from `atS` for `durationS` (classic b-roll).
+ *   - "pip": b-roll shows as a small picture-in-picture in the top-right corner.
+ * The b-roll plays from its own start, time-shifted to begin at `atS`. Window
+ * length is clamped to the b-roll's and base clip's durations.
+ */
+export async function insertBroll(
+  base: string,
+  broll: string,
+  output: string,
+  atS: number,
+  durationS: number,
+  mode: BrollMode = "replace",
+): Promise<void> {
+  const [b, r] = await Promise.all([probe(base), probe(broll)]);
+  const W = b.width;
+  const H = b.height;
+  if (!W || !H) {
+    throw new FfmpegError(`insertBroll: bad base dimensions ${W}x${H}`, "", null);
+  }
+  const fps = b.fps && b.fps > 0 ? Math.round(b.fps) : 30;
+  const at = Math.max(0, Math.min(atS, Math.max(0, b.duration - 0.2)));
+  const dur = Math.max(0.2, Math.min(durationS, r.duration, b.duration - at));
+  const end = at + dur;
+  const margin = Math.round(Math.min(W, H) * 0.04);
+
+  const offsetPts = `setpts=PTS-STARTPTS+${at.toFixed(3)}/TB`;
+  const enable = `enable='between(t,${at.toFixed(3)},${end.toFixed(3)})'`;
+  let filter: string;
+  if (mode === "pip") {
+    filter =
+      `[1:v]scale=${Math.round(W / 3)}:-2,setsar=1,fps=${fps},trim=0:${dur.toFixed(3)},${offsetPts}[bv];` +
+      `[0:v][bv]overlay=x=W-w-${margin}:y=${margin}:${enable}:eof_action=pass,format=yuv420p[vout]`;
+  } else {
+    filter =
+      `[1:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${fps},` +
+      `trim=0:${dur.toFixed(3)},${offsetPts}[bv];` +
+      `[0:v][bv]overlay=${enable}:eof_action=pass,format=yuv420p[vout]`;
+  }
+
+  const args = [
+    "-hide_banner",
+    "-y",
+    "-i",
+    base,
+    "-i",
+    broll,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[vout]",
+    "-map",
+    "0:a?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "20",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-movflags",
+    "+faststart",
+    output,
+  ];
+  await runCapture("ffmpeg", args, { timeoutMs: 10 * 60_000 });
+}
+
+/**
+ * Composite a transparent overlay graphic (alpha .mov from Remotion, sized to the
+ * base clip) on top of `base` during [atS, atS+durationS], keeping the base video
+ * and audio underneath. The graphic animates from its own start at `atS`.
+ */
+export async function overlayGraphic(
+  base: string,
+  overlay: string,
+  output: string,
+  atS: number,
+  durationS: number,
+): Promise<void> {
+  const b = await probe(base);
+  const fps = b.fps && b.fps > 0 ? Math.round(b.fps) : 30;
+  const at = Math.max(0, Math.min(atS, Math.max(0, b.duration - 0.2)));
+  const dur = Math.max(0.2, Math.min(durationS, b.duration - at));
+  const end = at + dur;
+
+  const filter =
+    `[1:v]fps=${fps},setpts=PTS-STARTPTS+${at.toFixed(3)}/TB[gv];` +
+    `[0:v][gv]overlay=0:0:enable='between(t,${at.toFixed(3)},${end.toFixed(3)})':eof_action=pass:format=auto,` +
+    `format=yuv420p[vout]`;
+
+  const args = [
+    "-hide_banner",
+    "-y",
+    "-i",
+    base,
+    "-i",
+    overlay,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[vout]",
+    "-map",
+    "0:a?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "20",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-movflags",
+    "+faststart",
+    output,
+  ];
+  await runCapture("ffmpeg", args, { timeoutMs: 10 * 60_000 });
+}

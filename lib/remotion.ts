@@ -92,3 +92,62 @@ export async function renderTitleCard(
     crf: 20,
   });
 }
+
+export type GraphicKind = "lower_third" | "callout";
+
+export type GraphicProps = {
+  kind: GraphicKind;
+  title: string;
+  subtitle?: string;
+  theme: TitleCardTheme;
+  position: "top" | "center" | "bottom";
+  width: number;
+  height: number;
+  duration_s: number;
+  fps?: number;
+};
+
+/**
+ * Render an animated overlay graphic with a transparent background to a ProRes
+ * 4444 .mov (carries an alpha channel). ffmpeg then composites it over footage.
+ */
+export async function renderGraphicOverlay(
+  output: string,
+  props: GraphicProps,
+  onProgress?: (msg: string) => void,
+): Promise<void> {
+  const fps = props.fps ?? 30;
+  const inputProps = {
+    kind: props.kind,
+    title: props.title,
+    subtitle: props.subtitle ?? "",
+    theme: props.theme,
+    position: props.position,
+    width: props.width,
+    height: props.height,
+    duration_s: props.duration_s,
+    fps,
+  };
+
+  const [serveUrl] = await Promise.all([getBundle(onProgress), getBrowser(onProgress)]);
+
+  const composition = await selectComposition({
+    serveUrl,
+    id: "Graphic",
+    inputProps,
+  });
+
+  onProgress?.(
+    `Rendering ${props.kind} graphic "${props.title}" at ${composition.width}x${composition.height}`,
+  );
+
+  await renderMedia({
+    composition,
+    serveUrl,
+    codec: "prores",
+    proResProfile: "4444",
+    pixelFormat: "yuva444p10le",
+    outputLocation: output,
+    inputProps,
+  });
+}
